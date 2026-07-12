@@ -382,15 +382,54 @@
       .then(function(){ scriptsLoaded = true; });
   }
 
-  // ---- engine (FIX: resolve blob URLs BEFORE load, or postMessage throws DataCloneError) ----
+  function withTimeout(p, ms, msg){
+    return Promise.race([p, new Promise(function(_, rej){ setTimeout(function(){ rej(new Error(msg||'tiempo agotado')); }, ms); })]);
+  }
+
+  // Descarga con progreso real + detección de estancamiento
+  function fetchAsBlobURL(url, mime, onProgress, onStall){
+    return fetch(url).then(function(res){
+      if(!res.ok) throw new Error('HTTP '+res.status+' descargando '+(url.split('/').pop()));
+      var total = parseInt(res.headers.get('content-length')||'0', 10);
+      if(!res.body || !res.body.getReader){
+        return res.blob().then(function(b){
+          if(onProgress) onProgress(1, b.size, b.size);
+          return URL.createObjectURL(new Blob([b], {type:mime}));
+        });
+      }
+      var reader = res.body.getReader();
+      var chunks = [], received = 0, lastTick = Date.now();
+      var stallTimer = setInterval(function(){
+        if(Date.now() - lastTick > 15000 && onStall){ onStall(received); lastTick = Date.now(); }
+      }, 5000);
+      function pump(){
+        return reader.read().then(function(r){
+          if(r.done){
+            clearInterval(stallTimer);
+            return URL.createObjectURL(new Blob(chunks, {type: mime}));
+          }
+          chunks.push(r.value);
+          received += r.value.length;
+          lastTick = Date.now();
+          if(onProgress) onProgress(total ? received/total : 0, received, total);
+          return pump();
+        });
+      }
+      return pump();
+    });
+  }
+
+  // ---- engine ----
   function ensureEngine(){
     if(engineReady) return Promise.resolve();
     setStatus('cargando','cargando motor');
     consoleEl.setAttribute('data-live','1');
+    progLabel.textContent = 'Cargando motor…';
+    fill.classList.add('indet'); pct.textContent = '···';
     log('cargando librerías del motor…','sys');
     return loadEngineScripts().then(function(){
       if(!window.FFmpegWASM || !window.FFmpegUtil) throw new Error('no se cargaron las librerías (revisa tu conexión)');
-      var FFmpeg = window.FFmpegWASM.FFmpeg, toBlobURL = window.FFmpegUtil.toBlobURL;
+      var FFmpeg = window.FFmpegWASM.FFmpeg;
       if(!ffmpeg){
         ffmpeg = new FFmpeg();
         ffmpeg.on('log', function(e){ if(e && e.message) log(e.message); });
@@ -398,12 +437,38 @@
       }
       var base = CDN+'/@ffmpeg/core@'+VER.core+'/dist/umd';
       log('descargando core (~30 MB, una sola vez)…','sys');
+
+      var stallWarned = false;
+      var onProg = function(ratio, received, total){
+        if(total > 0){
+          fill.classList.remove('indet');
+          fill.style.width = (ratio*100).toFixed(0) + '%';
+          pct.textContent = (ratio*100).toFixed(0) + '%';
+          progLabel.textContent = 'Cargando motor · ' + (received/1048576).toFixed(1) + ' / ' + (total/1048576).toFixed(1) + ' MB';
+        } else {
+          fill.classList.add('indet');
+          pct.textContent = (received/1048576).toFixed(1) + ' MB';
+          progLabel.textContent = 'Cargando motor…';
+        }
+      };
+      var onStall = function(){
+        if(stallWarned) return; stallWarned = true;
+        log('la descarga se estancó — puede ser la red móvil o el CDN. Sigue intentando…','err');
+      };
+
       return Promise.all([
-        toBlobURL(base+'/ffmpeg-core.js','text/javascript'),
-        toBlobURL(base+'/ffmpeg-core.wasm','application/wasm')
+        fetchAsBlobURL(base+'/ffmpeg-core.js', 'text/javascript'),
+        fetchAsBlobURL(base+'/ffmpeg-core.wasm', 'application/wasm', onProg, onStall)
       ]);
     }).then(function(urls){
-      return ffmpeg.load({ coreURL: urls[0], wasmURL: urls[1] });   // urls[0]/urls[1] are resolved strings now
+      log('instanciando WebAssembly…','sys');
+      progLabel.textContent = 'Instanciando motor…';
+      fill.classList.add('indet'); pct.textContent = '···';
+      return withTimeout(
+        ffmpeg.load({ coreURL: urls[0], wasmURL: urls[1] }),
+        60000,
+        'ffmpeg.load() se colgó — probablemente memoria insuficiente del navegador'
+      );
     }).then(function(){
       engineReady = true;
       log('motor listo.','sys');
@@ -557,7 +622,13 @@
     var inN='in'+(ie?'.'+ie:''), outN='out.'+outExt, fetchFile;
 
     ensureEngine()
-      .then(function(){ setStatus('trabajando','trabajando'); fetchFile=window.FFmpegUtil.fetchFile; log('leyendo entrada…','sys'); return fetchFile(currentFile); })
+      .then(function(){
+        setStatus('trabajando','trabajando');
+        // reset UI tras la fase de carga del motor
+        progLabel.textContent = fmt==='mp4'?'Transcodificando…':(fmt==='gif'?'Generando GIF…':'Extrayendo audio…');
+        fill.classList.remove('indet'); fill.style.width='0%'; pct.textContent='0%';
+        fetchFile=window.FFmpegUtil.fetchFile; log('leyendo entrada…','sys'); return fetchFile(currentFile);
+      })
       .then(function(data){ return ffmpeg.writeFile(inN, data); })
       .then(function(){
         startTimer();
